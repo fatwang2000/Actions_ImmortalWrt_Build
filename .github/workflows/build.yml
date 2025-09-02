@@ -1,151 +1,73 @@
 name: Build ImmortalWrt
 
 on:
-  workflow_dispatch: # Allows manual triggering
+  workflow_dispatch:
   schedule:
-    - cron: '0 0 */2 * *' # Runs every 2 days at midnight UTC
+    - cron: '0 0 */2 * *'
 
 jobs:
-  setup_environment:
+  list-configs:
     runs-on: ubuntu-latest
-    steps:
-      - name: Setup build environment
-        run: |
-          echo "开始准备immortalwrt编译环境"
-          sudo bash -c 'bash <(curl -s https://build-scripts.immortalwrt.org/init_build_environment.sh)'
-          sudo apt -y autoremove --purge
-          sudo apt -y clean
-
-          git clone --depth=1 https://github.com/openwrt-dev/po2lmo
-          (cd po2lmo && sudo make && sudo make install)
-
-          df -h
-          
-      - name: Initialize ccache
-        run: |
-          mkdir -p ~/.ccache
-          ccache -M 5G # Set max cache size to 5GB
-          ccache -z # Show initial ccache stats
-
-      - name: Cache ccache
-        uses: actions/cache@v4
-        with:
-          path: ~/.ccache
-          key: ${{ runner.os }}-ccache-${{ hashFiles('.github/workflows/build.yml') }}
-          restore-keys: |
-            ${{ runner.os }}-ccache-
-
-  list_configs:
-    runs-on: ubuntu-latest
-    needs: setup_environment
     outputs:
-      configs: ${{ steps.set_configs.outputs.configs }}
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: List config files
-        id: set_configs
+      - uses: actions/checkout@v4
+      - id: set-matrix
         run: |
-          configs=$(ls *.config 2>/dev/null | jq -R -s -c 'split("\n") | del(.[-1])')
-          echo "configs=$configs" >> $GITHUB_OUTPUT
+          echo "matrix=$(ls *.config | jq -Rsc 'split("\n") | map(select(. != ""))')" >> $GITHUB_OUTPUT
 
-  build:
-    needs: [setup_environment, list_configs]
+  create-release:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        config: ${{ fromJson(needs.list_configs.outputs.configs) }}
+    needs: list-configs
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Restore ccache
-        uses: actions/cache@v4
+      - uses: actions/checkout@v4
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
         with:
-          path: ~/.ccache
-          key: ${{ runner.os }}-ccache-${{ hashFiles('.github/workflows/build.yml') }}
-          restore-keys: |
-            ${{ runner.os }}-ccache-
-
-      - name: Clone ImmortalWrt source
-        run: |
-          git clone -b master --single-branch --filter=blob:none https://github.com/immortalwrt/immortalwrt immortalwrt
-          # Adjust branch as needed, e.g., master or openwrt-21.02
-
-      - name: Copy custom .config
-        run: |
-          cp "${{ matrix.config }}" immortalwrt/.config
-
-      - name: Update and install feeds
-        working-directory: immortalwrt
-        run: |
-          ./scripts/feeds update -a
-          ./scripts/feeds install -a
-
-      - name: Run diy.sh if exists
-        working-directory: immortalwrt
-        run: |
-          if [ -f ../diy.sh ]; then
-            bash ../diy.sh
-          fi
-
-      - name: Load config and build
-        working-directory: immortalwrt
-        env:
-          CCACHE_DIR: ~/.ccache
-        run: |
-          ccache -z # Show ccache stats before build
-          make defconfig
-          make download -j$(nproc)
-          make -j$(nproc) V=s
-          ccache -s # Show ccache stats after build
-
-      - name: Prepare artifacts
-        run: |
-          mkdir -p artifacts
-          cp -r immortalwrt/bin/targets/* artifacts/ || true
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-${{ matrix.config }}
-          path: artifacts/
-          retention-days: 1
-
-  release:
-    needs: build
-    runs-on: ubuntu-latest
-    if: always()
-    steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: all-artifacts
-
-      - name: Create Release
-        id: create_release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: v${{ github.run_number }}
-          release_name: Build ${{ github.run_number }}
-          body: Automated builds of ImmortalWrt using custom configs (Scheduled or Manual)
+          tag_name: "build-${{ github.run_id }}"
+          name: "Auto Build ${{ github.run_id }}"
+          body: "Automated build of ImmortalWrt firmware variants."
           draft: false
           prerelease: false
 
-      - name: Upload Release Assets
+  build:
+    needs: [list-configs, create-release]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        config: ${{ fromJson(needs.list-configs.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup build environment
+        run: sudo bash -c 'bash <(curl -s https://build-scripts.immortalwrt.org/init_build_environment.sh)'
+      - name: Clone ImmortalWrt
+        run: git clone --depth 1 -b master https://github.com/immortalwrt/immortalwrt.git
+      - name: Prepare config and build
         run: |
-          cd all-artifacts
-          for artifact_dir in *; do
-            cd "$artifact_dir"
-            zip -r "../../${artifact_dir}.zip" .
-            cd ..
-          done
-          cd ../..
-          for zip_file in all-artifacts/*.zip; do
-            gh release upload v${{ github.run_number }} "$zip_file" --clobber
-          done
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CONFIG_FILE="${{ matrix.config }}"
+          AAA=$(echo "$CONFIG_FILE" | cut -d';' -f1)
+          BBB=$(echo "$CONFIG_FILE" | cut -d';' -f2 | sed 's/\.config$//')
+          
+          cp "$CONFIG_FILE" immortalwrt/.config
+          cd immortalwrt
+          
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          
+          #Run diy.sh if exists
+          if [ -f ../diy.sh ]; then
+            cp ../diy.sh ./
+            bash ../diy.sh
+          fi
+          
+          make defconfig
+          make download -j$(nproc)
+          make -j$(nproc)
+          
+          mkdir ../releases
+          find bin/targets -type f \( -name "*.bin" -o -name "*.img" -o -name "*.img.gz" -o -name "*.squashfs" \) -exec bash -c 'cp "$0" ../releases/"$BBB"-$(basename "$0")' {} \;
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "build-${{ github.run_id }}"
+          files: releases/*
