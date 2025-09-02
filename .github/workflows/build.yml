@@ -1,9 +1,9 @@
 name: Build ImmortalWrt
 
 on:
-  push:
-    branches:
-      - main
+  #push:
+  #  branches:
+  #    - main
   workflow_dispatch: # Allows manual triggering
   schedule:
     - cron: '0 0 */2 * *' # Runs every 2 days at midnight UTC
