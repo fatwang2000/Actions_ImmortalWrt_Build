@@ -110,13 +110,16 @@ jobs:
         
     - name: Create individual firmware package
       run: |
-        # 从config文件名获取标识
-        filename="${matrix.config_file%.config}"
-        IFS=';' read -ra PARTS <<< "$filename"
-        AAA=${PARTS[0]}
-        BBB=${PARTS[1]}
+        # 直接使用sed处理文件名
+        CONFIG_FILE="${{ matrix.config_file }}"
+        FILENAME=$(echo "$CONFIG_FILE" | sed 's/\.config$//')
+        
+        AAA=$(echo "$FILENAME" | cut -d';' -f1)
+        BBB=$(echo "$FILENAME" | cut -d';' -f2)
         
         PACKAGE_NAME="${AAA}-${BBB}-firmware.zip"
+        
+        echo "Creating package: $PACKAGE_NAME"
         
         # 创建压缩包
         cd firmware-output/${AAA}
@@ -129,7 +132,7 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: ${{ matrix.config_file }}-firmware
-        path: ${{ matrix.config_file }}.zip
+        path: "$PACKAGE_NAME"
         if-no-files-found: error
 
   release:
