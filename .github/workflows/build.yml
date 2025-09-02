@@ -29,6 +29,8 @@ jobs:
           body: "Automated build of ImmortalWrt firmware variants."
           draft: false
           prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
 
   build:
     needs: [list-configs, create-release]
@@ -78,3 +80,5 @@ jobs:
         with:
           tag_name: "build-${{ github.run_id }}"
           files: releases/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
