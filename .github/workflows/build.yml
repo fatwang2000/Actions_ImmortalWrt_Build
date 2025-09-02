@@ -86,7 +86,7 @@ jobs:
         cd $BUILD_DIR
         
         # 从文件名解析AAA和BBB
-        filename="${${matrix.config_file}%.config}"
+        filename="${matrix.config_file%.config}"
         IFS=';' read -ra PARTS <<< "$filename"
         AAA=${PARTS[0]}
         BBB=${PARTS[1]}
@@ -110,16 +110,19 @@ jobs:
     - name: Create individual firmware package
       run: |
         # 从config文件名获取标识
-        filename="${${matrix.config_file}%.config}"
+        filename="${matrix.config_file%.config}"
         IFS=';' read -ra PARTS <<< "$filename"
         AAA=${PARTS[0]}
+        BBB=${PARTS[1]}
+        
+        PACKAGE_NAME="${AAA}-${BBB}-firmware.zip"
         
         # 创建压缩包
         cd firmware-output/${AAA}
-        zip -r "../../${AAA}-firmware.zip" .
+        zip -r "../../${PACKAGE_NAME}" .
         cd ../..
         
-        echo "Created package: ${AAA}-firmware.zip"
+        echo "Created package: ${PACKAGE_NAME}"
 
     - name: Upload individual firmware package
       uses: actions/upload-artifact@v4
@@ -133,6 +136,10 @@ jobs:
     runs-on: ubuntu-latest
     if: success()
     steps:
+    - name: Get current date
+      id: date
+      run: echo "date=$(date +'%Y-%m-%d %H:%M:%S')" >> $GITHUB_OUTPUT
+
     - name: Download all artifacts
       uses: actions/download-artifact@v4
       with:
@@ -153,14 +160,13 @@ jobs:
         body: |
           Auto-built ImmortalWrt firmware
           
-          Build date: ${{ github.event.head_commit.timestamp || now() }}
+          Build date: ${{ steps.date.outputs.date }}
           Commit: ${{ github.sha }}
+          Run ID: ${{ github.run_id }}
           
           ## Firmware Packages
           
-          Each package contains firmware for a specific configuration:
-          
-          ${{ needs.build.outputs.config_list }}
+          Each package contains firmware for a specific configuration.
           
           ### Configurations included:
           ${{ fromJSON(needs.setup.outputs.config_files) }}
