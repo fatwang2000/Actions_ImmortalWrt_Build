@@ -1,4 +1,4 @@
-name: Build ImmortalWrt Firmware
+name: Build
 
 on:
   schedule:
@@ -35,9 +35,17 @@ jobs:
   build:
     needs: setup
     runs-on: ubuntu-latest
+    # 关键设置：允许单个任务失败而不影响整个job
+    continue-on-error: ${{ matrix.allow_failure }}
     strategy:
       matrix:
         config_file: ${{ fromJSON(needs.setup.outputs.config_files) }}
+        # 为每个配置设置allow_failure为true，这样单个失败不会影响其他
+        allow_failure: [true]
+      # 设置最大并行数，避免资源耗尽
+      max-parallel: 4
+      # 即使某些任务失败也继续执行其他任务
+      fail-fast: false
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
@@ -83,10 +91,13 @@ jobs:
 
     - name: Build firmware
       run: |
+        set +e  # 允许脚本中的命令失败而不退出
+        
         cd $BUILD_DIR
         
-        # 使用sed移除文件扩展名
-        FILENAME=$(echo "${{ matrix.config_file }}" | sed 's/\.config$//')
+        # 从文件名解析AAA和BBB
+        CONFIG_FILE="${{ matrix.config_file }}"
+        FILENAME=$(echo "$CONFIG_FILE" | sed 's/\.config$//')
         
         IFS=';' read -ra PARTS <<< "$FILENAME"
         AAA=${PARTS[0]}
@@ -94,51 +105,95 @@ jobs:
         
         echo "Building for: AAA=$AAA, BBB=$BBB"
         
-        # 生成defconfig
-        make defconfig
+        # 生成defconfig，过滤常见的无害警告
+        make defconfig 2>&1 | grep -E -v \
+          -e "WARNING:.*does not exist" \
+          -e "WARNING:.*missing dependencies" \
+          -e "WARNING:.*depends on" || true
+        
+        # 检查defconfig是否成功
+        if [ ! -f .config ]; then
+          echo "Error: .config file was not created!"
+          exit 1
+        fi
+        
+        echo "Defconfig completed successfully"
         
         # 开始编译
-        make -j$(($(nproc) + 1)) || make -j1 V=s
+        echo "Starting compilation with $(($(nproc) + 1)) threads..."
         
-        # 创建输出目录
-        mkdir -p ../firmware-output/${AAA}
+        # 尝试编译，但即使失败也继续执行后续步骤
+        make -j$(($(nproc) + 1)) 2>&1 | tee compile.log
+        COMPILE_STATUS=${PIPESTATUS[0]}
         
-        # 复制编译好的固件
-        find bin/targets -name "*.bin" -exec cp {} ../firmware-output/${AAA}/ \; 2>/dev/null || true
-        find bin/targets -name "*.gz" -exec cp {} ../firmware-output/${AAA}/ \; 2>/dev/null || true
-        find bin/targets -name "*.img" -exec cp {} ../firmware-output/${AAA}/ \; 2>/dev/null || true
+        if [ $COMPILE_STATUS -ne 0 ]; then
+          echo "Multi-thread compilation failed, retrying with single thread..."
+          make -j1 V=s 2>&1 | tee compile-single.log
+          COMPILE_STATUS=${PIPESTATUS[0]}
+        fi
         
-    - name: Create individual firmware package
+        if [ $COMPILE_STATUS -eq 0 ]; then
+          echo "Compilation successful"
+          # 创建输出目录
+          mkdir -p ../firmware-output/${AAA}
+          
+          # 复制编译好的固件
+          find bin/targets/ -name "*.bin" -exec cp {} ../firmware-output/${AAA}/ \; 2>/dev/null || true
+          find bin/targets/ -name "*.gz" -exec cp {} ../firmware-output/${AAA}/ \; 2>/dev/null || true
+          find bin/targets/ -name "*.img" -exec cp {} ../firmware-output/${AAA}/ \; 2>/dev/null || true
+          find bin/targets/ -name "*.trx" -exec cp {} ../firmware-output/${AAA}/ \; 2>/dev/null || true
+          
+          echo "Firmware files copied successfully"
+        else
+          echo "Compilation failed for config: ${{ matrix.config_file }}"
+          # 这里不退出，让其他配置继续编译
+        fi
+
+    - name: Create package if compilation succeeded
+      if: success() || failure()  # 无论编译是否成功都执行
       run: |
-        # 直接使用sed处理文件名
         CONFIG_FILE="${{ matrix.config_file }}"
         FILENAME=$(echo "$CONFIG_FILE" | sed 's/\.config$//')
-        
         AAA=$(echo "$FILENAME" | cut -d';' -f1)
         BBB=$(echo "$FILENAME" | cut -d';' -f2)
-        
         PACKAGE_NAME="${AAA}-${BBB}-firmware.zip"
         
-        echo "Creating package: $PACKAGE_NAME"
-        
-        # 创建压缩包
-        cd firmware-output/${AAA}
-        zip -r "../../${PACKAGE_NAME}" .
-        cd ../..
-        
-        echo "Created package: ${PACKAGE_NAME}"
+        # 检查是否有编译输出的文件
+        if [ -d "firmware-output/${AAA}" ] && [ -n "$(ls -A firmware-output/${AAA} 2>/dev/null)" ]; then
+          echo "Creating package: $PACKAGE_NAME"
+          cd firmware-output/${AAA}
+          zip -r "../../${PACKAGE_NAME}" .
+          cd ../..
+          echo "Package created successfully"
+        else
+          echo "No firmware files found for $PACKAGE_NAME, skipping package creation"
+          # 创建一个空文件标记编译失败
+          touch "${PACKAGE_NAME}.failed"
+        fi
 
-    - name: Upload individual firmware package
+    - name: Upload successful firmware package
+      if: success()  # 只有编译成功才上传
       uses: actions/upload-artifact@v4
       with:
-        name: ${{ matrix.config_file }}-firmware
-        path: "$PACKAGE_NAME"
-        if-no-files-found: error
+        name: ${{ matrix.config_file }}-success
+        path: |
+          ${AAA}-${BBB}-firmware.zip
+        if-no-files-found: ignore
+
+    - name: Upload failure marker
+      if: failure()  # 编译失败时上传标记文件
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.config_file }}-failed
+        path: |
+          ${AAA}-${BBB}-firmware.zip.failed
+        if-no-files-found: ignore
 
   release:
     needs: build
     runs-on: ubuntu-latest
-    if: success()
+    # 即使build job中有失败的任务也继续执行
+    if: always()
     steps:
     - name: Get current date
       id: date
@@ -147,18 +202,41 @@ jobs:
     - name: Download all artifacts
       uses: actions/download-artifact@v4
       with:
-        path: individual-packages
+        path: all-artifacts
 
-    - name: List downloaded artifacts
+    - name: Process successful builds
       run: |
-        echo "Downloaded artifacts:"
-        find individual-packages -type f -name "*.zip"
+        mkdir -p release-firmware
+        
+        # 复制所有成功的固件包
+        find all-artifacts -name "*.zip" -exec cp {} release-firmware/ \; 2>/dev/null || true
+        
+        echo "Successful firmware packages:"
+        ls -la release-firmware/ || echo "No successful builds"
 
-    - name: Create release with individual packages
+    - name: Create summary of build results
+      run: |
+        # 创建构建结果摘要
+        echo "# Build Results - ${{ steps.date.outputs.date }}" > build-summary.md
+        echo "" >> build-summary.md
+        echo "## Successful Builds" >> build-summary.md
+        find all-artifacts -name "*-success" -type d | while read dir; do
+          config=$(basename "$dir" | sed 's/-success$//')
+          echo "- ✅ $config" >> build-summary.md
+        done || echo "- No successful builds" >> build-summary.md
+        
+        echo "" >> build-summary.md
+        echo "## Failed Builds" >> build-summary.md
+        find all-artifacts -name "*-failed" -type d | while read dir; do
+          config=$(basename "$dir" | sed 's/-failed$//')
+          echo "- ❌ $config" >> build-summary.md
+        done || echo "- No failed builds" >> build-summary.md
+
+    - name: Create release with successful firmware
+      if: success() || failure()  # 无论是否有成功构建都创建release
       uses: softprops/action-gh-release@v1
       with:
-        files: |
-          individual-packages/**/*.zip
+        files: release-firmware/*.zip
         tag_name: build-${{ github.run_id }}
         name: Build #${{ github.run_number }}
         body: |
@@ -168,11 +246,11 @@ jobs:
           Commit: ${{ github.sha }}
           Run ID: ${{ github.run_id }}
           
-          ## Firmware Packages
+          ## Build Summary
           
-          Each package contains firmware for a specific configuration.
+          ${{ steps.create-summary.outputs.content }}
           
-          ### Configurations included:
-          ${{ fromJSON(needs.setup.outputs.config_files) }}
+          ### Note
+          Only successful builds are included in this release.
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
