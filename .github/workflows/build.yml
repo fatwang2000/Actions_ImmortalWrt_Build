@@ -1,0 +1,149 @@
+name: Build ImmortalWrt
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch: # Allows manual triggering
+  schedule:
+    - cron: '0 0 */2 * *' # Runs every 2 days at midnight UTC
+
+jobs:
+  setup_environment:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup build environment
+        run: |
+          sudo apt update
+          sudo apt full-upgrade -y
+          #sudo apt install -y ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential \
+          #bzip2 ccache clang cmake cpio curl device-tree-compiler ecj fastjar flex gawk gettext gcc-multilib \
+          #g++-multilib git gnutls-dev gperf haveged help2man intltool lib32gcc-s1 libc6-dev-i386 libelf-dev \
+          #libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses-dev libpython3-dev \
+          #libreadline-dev libssl-dev libtool libyaml-dev libz-dev lld llvm lrzsz mkisofs msmtp nano \
+          #ninja-build p7zip p7zip-full patch pkgconf python3 python3-pip python3-ply python3-docutils \
+          #python3-pyelftools qemu-utils re2c rsync scons squashfs-tools subversion swig texinfo uglifyjs \
+          #upx-ucl unzip vim wget xmlto xxd zlib1g-dev zstd
+          sudo bash -c 'bash <(curl -s https://build-scripts.immortalwrt.org/init_build_environment.sh)>'
+          sudo apt -y autoremove --purge
+          sudo apt -y clean
+
+          git clone --depth=1 https://github.com/openwrt-dev/po2lmo
+          (cd po2lmo && sudo make && sudo make install)
+
+          df -h
+          
+      - name: Cache build environment
+        uses: actions/cache@v4
+        with:
+          path: /usr/local
+          key: ${{ runner.os }}-build-env-${{ hashFiles('**/setup_environment') }}
+
+  list_configs:
+    runs-on: ubuntu-latest
+    needs: setup_environment
+    outputs:
+      configs: ${{ steps.set_configs.outputs.configs }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: List config files
+        id: set_configs
+        run: |
+          configs=$(ls *.config 2>/dev/null | jq -R -s -c 'split("\n") | del(.[-1])')
+          echo "configs=$configs" >> $GITHUB_OUTPUT
+
+  build:
+    needs: [setup_environment, list_configs]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        config: ${{ fromJson(needs.list_configs.outputs.configs) }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Restore cached environment
+        uses: actions/cache@v4
+        with:
+          path: /usr/local
+          key: ${{ runner.os }}-build-env-${{ hashFiles('**/setup_environment') }}
+
+      - name: Clone ImmortalWrt source
+        run: |
+          git clone -b master --single-branch --filter=blob:none https://github.com/immortalwrt/immortalwrt immortalwrt
+          # Adjust branch as needed, e.g., master or openwrt-21.02
+
+      - name: Copy custom .config
+        run: |
+          cp "${{ matrix.config }}" immortalwrt/.config
+
+      - name: Update and install feeds
+        working-directory: immortalwrt
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Run diy.sh if exists
+        working-directory: immortalwrt
+        run: |
+          if [ -f ../diy.sh ]; then
+            bash ../diy.sh
+          fi
+
+      - name: Load config and build
+        working-directory: immortalwrt
+        run: |
+          make defconfig
+          make download -j$(nproc)
+          make -j$(nproc) V=s
+
+      - name: Prepare artifacts
+        run: |
+          mkdir -p artifacts
+          cp -r immortalwrt/bin/targets/* artifacts/ || true
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ matrix.config }}
+          path: artifacts/
+          retention-days: 1
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all-artifacts
+
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: v${{ github.run_number }}
+          release_name: Build ${{ github.run_number }}
+          body: Automated builds of ImmortalWrt using custom configs (Scheduled or Manual)
+          draft: false
+          prerelease: false
+
+      - name: Upload Release Assets
+        run: |
+          cd all-artifacts
+          for artifact_dir in *; do
+            cd "$artifact_dir"
+            zip -r "../../${artifact_dir}.zip" .
+            cd ..
+          done
+          cd ../..
+          for zip_file in all-artifacts/*.zip; do
+            gh release upload v${{ github.run_number }} "$zip_file" --clobber
+          done
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
