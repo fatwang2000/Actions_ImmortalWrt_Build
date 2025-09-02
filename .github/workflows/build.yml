@@ -28,11 +28,52 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
 
+    - name: Install GitHub CLI
+      run: |
+        curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+        sudo apt update
+        sudo apt install gh -y
+
     - name: Delete old releases
-      uses: dev-drprasad/delete-old-releases@v0.2.3
-      with:
-        keep_latest: ${{ env.RELEASE_RETENTION_COUNT }}
-        delete_tag_pattern: 'build-*'
+      run: |
+        # 获取所有以 build- 开头的release
+        releases=$(gh release list --repo ${{ github.repository }} --limit 100 --json tagName,isDraft --jq '.[] | select(.tagName | startswith("build-")) | .tagName')
+        
+        if [ -z "$releases" ]; then
+          echo "No build-* releases found to delete"
+          exit 0
+        fi
+        
+        echo "Found releases:"
+        echo "$releases"
+        
+        # 转换为数组
+        readarray -t release_array <<< "$releases"
+        total_releases=${#release_array[@]}
+        
+        echo "Total build-* releases: $total_releases"
+        echo "Keeping latest ${{ env.RELEASE_RETENTION_COUNT }} releases"
+        
+        # 计算需要删除的数量
+        if [ $total_releases -gt ${{ env.RELEASE_RETENTION_COUNT }} ]; then
+          releases_to_delete=$((total_releases - ${{ env.RELEASE_RETENTION_COUNT }}))
+          echo "Need to delete $releases_to_delete releases"
+          
+          # 删除旧的release（跳过最新的几个）
+          for ((i=0; i<releases_to_delete; i++)); do
+            release_tag=${release_array[i]}
+            echo "Deleting release: $release_tag"
+            gh release delete "$release_tag" --repo ${{ github.repository }} --yes
+            if [ $? -eq 0 ]; then
+              echo "Successfully deleted release: $release_tag"
+            else
+              echo "Failed to delete release: $release_tag"
+            fi
+          done
+        else
+          echo "No need to delete any releases (current: $total_releases, keep: ${{ env.RELEASE_RETENTION_COUNT }})"
+        fi
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
