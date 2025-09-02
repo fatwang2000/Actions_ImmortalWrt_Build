@@ -85,9 +85,10 @@ jobs:
       run: |
         cd $BUILD_DIR
         
-        # 从文件名解析AAA和BBB
-        filename="${matrix.config_file%.config}"
-        IFS=';' read -ra PARTS <<< "$filename"
+        # 使用sed移除文件扩展名
+        FILENAME=$(echo "${{ matrix.config_file }}" | sed 's/\.config$//')
+        
+        IFS=';' read -ra PARTS <<< "$FILENAME"
         AAA=${PARTS[0]}
         BBB=${PARTS[1]}
         
@@ -106,7 +107,7 @@ jobs:
         find bin/targets -name "*.bin" -exec cp {} ../firmware-output/${AAA}/ \; 2>/dev/null || true
         find bin/targets -name "*.gz" -exec cp {} ../firmware-output/${AAA}/ \; 2>/dev/null || true
         find bin/targets -name "*.img" -exec cp {} ../firmware-output/${AAA}/ \; 2>/dev/null || true
-
+        
     - name: Create individual firmware package
       run: |
         # 从config文件名获取标识
