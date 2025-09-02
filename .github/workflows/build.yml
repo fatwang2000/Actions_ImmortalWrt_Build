@@ -42,6 +42,13 @@ jobs:
         run: sudo bash -c 'bash <(curl -s https://build-scripts.immortalwrt.org/init_build_environment.sh)'
       - name: Clone ImmortalWrt
         run: git clone --depth 1 -b master https://github.com/immortalwrt/immortalwrt.git
+      - name: Check and copy diy.sh to ImmortalWrt directory
+        run: |
+          if [ -f diy.sh ]; then
+            cp diy.sh immortalwrt/
+          else
+            echo "diy.sh not found, skipping copy."
+          fi
       - name: Prepare config and build
         run: |
           CONFIG_FILE="${{ matrix.config }}"
@@ -54,10 +61,10 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
           
-          #Run diy.sh if exists
-          if [ -f ../diy.sh ]; then
-            cp ../diy.sh ./
-            bash ../diy.sh
+          if [ -f diy.sh ]; then
+            bash diy.sh
+          else
+            echo "diy.sh not found, skipping execution."
           fi
           
           make defconfig
