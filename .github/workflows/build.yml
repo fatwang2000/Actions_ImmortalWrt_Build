@@ -1,84 +1,168 @@
-name: Build ImmortalWrt
+name: Build ImmortalWrt Firmware
 
 on:
-  workflow_dispatch:
   schedule:
+    # 每2天自动运行一次 (UTC时间)
     - cron: '0 0 */2 * *'
+  workflow_dispatch:  # 允许手动触发
+  push:
+    paths-ignore:     # 存储库发生代码更新时不自动执行
+      - '**.config'
+      - 'diy.sh'
+      - '.github/workflows/**'
+
+env:
+  BUILD_DIR: immortalwrt-build
 
 jobs:
-  list-configs:
+  setup:
     runs-on: ubuntu-latest
     outputs:
-      matrix: ${{ steps.set-matrix.outputs.matrix }}
+      config_files: ${{ steps.find-configs.outputs.config_files }}
     steps:
-      - uses: actions/checkout@v4
-      - id: set-matrix
-        run: |
-          echo "matrix=$(ls *.config | jq -Rsc 'split("\n") | map(select(. != ""))')" >> $GITHUB_OUTPUT
-
-  create-release:
-    runs-on: ubuntu-latest
-    needs: list-configs
-    steps:
-      - uses: actions/checkout@v4
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: "build-${{ github.run_id }}"
-          name: "Auto Build ${{ github.run_id }}"
-          body: "Automated build of ImmortalWrt firmware variants."
-          draft: false
-          prerelease: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    
+    - name: Find config files
+      id: find-configs
+      run: |
+        # 查找所有.config文件并格式化为JSON数组
+        config_files=$(find . -name "*.config" -printf '"%f",')
+        config_files="[${config_files%,}]"
+        echo "config_files=$config_files" >> $GITHUB_OUTPUT
+        echo "Found config files: $config_files"
 
   build:
-    needs: [list-configs, create-release]
+    needs: setup
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        config: ${{ fromJson(needs.list-configs.outputs.matrix) }}
+        config_file: ${{ fromJSON(needs.setup.outputs.config_files) }}
     steps:
-      - uses: actions/checkout@v4
-      - name: Setup build environment
-        run: sudo bash -c 'bash <(curl -s https://build-scripts.immortalwrt.org/init_build_environment.sh)'
-      - name: Clone ImmortalWrt
-        run: git clone --depth 1 -b master https://github.com/immortalwrt/immortalwrt.git
-      - name: Check and copy diy.sh to ImmortalWrt directory
-        run: |
-          if [ -f diy.sh ]; then
-            cp diy.sh immortalwrt/
-          else
-            echo "diy.sh not found, skipping copy."
-          fi
-      - name: Prepare config and build
-        run: |
-          CONFIG_FILE="${{ matrix.config }}"
-          AAA=$(echo "$CONFIG_FILE" | cut -d';' -f1)
-          BBB=$(echo "$CONFIG_FILE" | cut -d';' -f2 | sed 's/\.config$//')
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up environment
+      run: |
+        sudo bash -c 'bash <(curl -s https://build-scripts.immortalwrt.org/init_build_environment.sh)'
+
+    - name: Clone ImmortalWrt repository
+      run: |
+        git clone https://github.com/immortalwrt/immortalwrt.git --depth=1 -b master $BUILD_DIR
+
+    - name: Copy config file
+      run: |
+        cp "${{ matrix.config_file }}" $BUILD_DIR/.config
+        echo "Using config file: ${{ matrix.config_file }}"
+
+    - name: Check and copy diy.sh if exists
+      run: |
+        if [ -f diy.sh ]; then
+          cp diy.sh $BUILD_DIR/
+          chmod +x $BUILD_DIR/diy.sh
+          echo "diy.sh found and copied"
+        else
+          echo "diy.sh not found, skipping"
+        fi
+
+    - name: Update feeds
+      run: |
+        cd $BUILD_DIR
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+
+    - name: Run diy.sh if exists
+      run: |
+        cd $BUILD_DIR
+        if [ -f diy.sh ]; then
+          echo "Running diy.sh..."
+          ./diy.sh
+        else
+          echo "diy.sh not found, skipping"
+        fi
+
+    - name: Build firmware
+      run: |
+        cd $BUILD_DIR
+        
+        # 从文件名解析AAA和BBB
+        filename="${${matrix.config_file}%.config}"
+        IFS=';' read -ra PARTS <<< "$filename"
+        AAA=${PARTS[0]}
+        BBB=${PARTS[1]}
+        
+        echo "Building for: AAA=$AAA, BBB=$BBB"
+        
+        # 生成defconfig
+        make defconfig
+        
+        # 开始编译
+        make -j$(($(nproc) + 1)) || make -j1 V=s
+        
+        # 创建输出目录
+        mkdir -p ../firmware-output/${AAA}
+        
+        # 复制编译好的固件
+        find bin/targets -name "*.bin" -exec cp {} ../firmware-output/${AAA}/ \; 2>/dev/null || true
+        find bin/targets -name "*.gz" -exec cp {} ../firmware-output/${AAA}/ \; 2>/dev/null || true
+        find bin/targets -name "*.img" -exec cp {} ../firmware-output/${AAA}/ \; 2>/dev/null || true
+
+    - name: Create individual firmware package
+      run: |
+        # 从config文件名获取标识
+        filename="${${matrix.config_file}%.config}"
+        IFS=';' read -ra PARTS <<< "$filename"
+        AAA=${PARTS[0]}
+        
+        # 创建压缩包
+        cd firmware-output/${AAA}
+        zip -r "../../${AAA}-firmware.zip" .
+        cd ../..
+        
+        echo "Created package: ${AAA}-firmware.zip"
+
+    - name: Upload individual firmware package
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.config_file }}-firmware
+        path: ${{ matrix.config_file }}.zip
+        if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: success()
+    steps:
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: individual-packages
+
+    - name: List downloaded artifacts
+      run: |
+        echo "Downloaded artifacts:"
+        find individual-packages -type f -name "*.zip"
+
+    - name: Create release with individual packages
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          individual-packages/**/*.zip
+        tag_name: build-${{ github.run_id }}
+        name: Build #${{ github.run_number }}
+        body: |
+          Auto-built ImmortalWrt firmware
           
-          cp "$CONFIG_FILE" immortalwrt/.config
-          cd immortalwrt
+          Build date: ${{ github.event.head_commit.timestamp || now() }}
+          Commit: ${{ github.sha }}
           
-          ./scripts/feeds update -a
-          ./scripts/feeds install -a
+          ## Firmware Packages
           
-          if [ -f diy.sh ]; then
-            bash diy.sh
-          else
-            echo "diy.sh not found, skipping execution."
-          fi
+          Each package contains firmware for a specific configuration:
           
-          make defconfig
-          make download -j$(nproc)
-          make -j$(nproc)
+          ${{ needs.build.outputs.config_list }}
           
-          mkdir ../releases
-          find bin/targets -type f \( -name "*.bin" -o -name "*.img" -o -name "*.img.gz" -o -name "*.squashfs" \) -exec bash -c 'cp "$0" ../releases/"$BBB"-$(basename "$0")' {} \;
-      - name: Upload to release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: "build-${{ github.run_id }}"
-          files: releases/*
-        env:
-          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          ### Configurations included:
+          ${{ fromJSON(needs.setup.outputs.config_files) }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
