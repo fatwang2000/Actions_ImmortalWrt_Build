@@ -1,9 +1,6 @@
 name: Build ImmortalWrt
 
 on:
-  #push:
-  #  branches:
-  #    - main
   workflow_dispatch: # Allows manual triggering
   schedule:
     - cron: '0 0 */2 * *' # Runs every 2 days at midnight UTC
@@ -25,6 +22,7 @@ jobs:
           #python3-pyelftools qemu-utils re2c rsync scons squashfs-tools subversion swig texinfo uglifyjs \
           #upx-ucl unzip vim wget xmlto xxd zlib1g-dev zstd
 
+          echo "开始准备immortalwrt编译环境"
           sudo bash -c 'bash <(curl -s https://build-scripts.immortalwrt.org/init_build_environment.sh)'
           sudo apt -y autoremove --purge
           sudo apt -y clean
@@ -34,11 +32,13 @@ jobs:
 
           df -h
           
-      - name: Cache build environment
+      - name: Cache ccache
         uses: actions/cache@v4
         with:
-          path: /usr/local
-          key: ${{ runner.os }}-build-env-${{ hashFiles('**/setup_environment') }}
+          path: ~/.ccache
+          key: ${{ runner.os }}-ccache-${{ hashFiles('**/setup_environment') }}
+          restore-keys: |
+            ${{ runner.os }}-ccache-
 
   list_configs:
     runs-on: ubuntu-latest
@@ -65,11 +65,13 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Restore cached environment
+      - name: Restore ccache
         uses: actions/cache@v4
         with:
-          path: /usr/local
-          key: ${{ runner.os }}-build-env-${{ hashFiles('**/setup_environment') }}
+          path: ~/.ccache
+          key: ${{ runner.os }}-ccache-${{ hashFiles('**/setup_environment') }}
+          restore-keys: |
+            ${{ runner.os }}-ccache-
 
       - name: Clone ImmortalWrt source
         run: |
@@ -95,7 +97,10 @@ jobs:
 
       - name: Load config and build
         working-directory: immortalwrt
+        env:
+          CCACHE_DIR: ~/.ccache
         run: |
+          ccache -M 5G # Set ccache max size to 5GB
           make defconfig
           make download -j$(nproc)
           make -j$(nproc) V=s
