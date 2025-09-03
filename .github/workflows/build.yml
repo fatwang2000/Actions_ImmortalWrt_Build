@@ -176,6 +176,7 @@ jobs:
       run: |
         cp "${{ matrix.config_file }}" $BUILD_DIR/.config
         echo "Using config file: ${{ matrix.config_file }}"
+        ls -l $BUILD_DIR
 
     - name: Check and copy diy.sh if exists
       run: |
