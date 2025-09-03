@@ -155,7 +155,7 @@ jobs:
 
     - name: Clone ImmortalWrt repository
       run: |
-        git clone https://github.com/immortalwrt/immortalwrt.git --depth=1 -b master $BUILD_DIR
+        git clone https://github.com/immortalwrt/immortalwrt.git --depth=1 -b openwrt-24.10 $BUILD_DIR
 
     - name: Set up ccache and dl directories
       run: |
