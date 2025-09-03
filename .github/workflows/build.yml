@@ -234,10 +234,10 @@ jobs:
         export CCACHE_COMPRESSLEVEL=6
         
         # 生成defconfig，过滤常见的无害警告
-        make defconfig 2>&1 | grep -E -v \
-          -e "WARNING:.*does not exist" \
-          -e "WARNING:.*missing dependencies" \
-          -e "WARNING:.*depends on" || true
+        # make defconfig 2>&1 | grep -E -v \
+        #  -e "WARNING:.*does not exist" \
+        #  -e "WARNING:.*missing dependencies" \
+        #  -e "WARNING:.*depends on" || true
         
         # 检查defconfig是否成功
         if [ ! -f .config ]; then
