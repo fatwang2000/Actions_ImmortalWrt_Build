@@ -1,156 +1,469 @@
-name: Build ImmortalWRT
+name: Build ImmortalWrt Firmware
 
 on:
   schedule:
+    # 每2天自动运行一次 (UTC时间)
     - cron: '0 0 */2 * *'
-  workflow_dispatch:
+  workflow_dispatch:  # 允许手动触发
+  push:
+    paths-ignore:     # 存储库发生代码更新时不自动执行
+      - '**.config'
+      - 'diy.sh'
+      - '.github/workflows/**'
 
-permissions:
-  contents: write
+env:
+  BUILD_DIR: immortalwrt-build
+  GITHUB_TOKEN: ${{ secrets.GH_TOKEN || secrets.GITHUB_TOKEN }}
+  # 缓存配置
+  CCACHE_DIR: ${{ github.workspace }}/ccache
+  DL_DIR: ${{ github.workspace }}/dl
+  # Release保留数量
+  RELEASE_RETENTION_COUNT: 5
 
 jobs:
-  discover-configs:
+  # 清理旧的Release
+  cleanup-releases:
     runs-on: ubuntu-latest
-    outputs:
-      matrix: ${{ steps.set-matrix.outputs.matrix }}
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+    - name: Checkout repository
+      uses: actions/checkout@v4
 
-      - name: Discover config files
-        id: set-matrix
-        run: |
-          configs=$(ls *.config 2>/dev/null | grep ';' || true)
-          matrix='[]'
-          if [ -n "$configs" ]; then
-            jq_array=()
-            for config in $configs; do
-              owner=$(echo $config | cut -d';' -f1)
-              type=$(echo $config | cut -d';' -f2 | sed 's/\.config$//')
-              name="${type}_for_${owner}"
-              jq_array+=("{\"name\": \"$name\", \"config\": \"$config\"}")
-            done
-            matrix=$(jq -c -n --argjson arr "[${jq_array[*]}]" '$arr')
-          fi
-          echo "matrix=$matrix" >> $GITHUB_OUTPUT
+    - name: Install GitHub CLI
+      run: |
+        curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+        sudo apt update
+        sudo apt install gh -y
+
+    - name: Delete old releases
+      run: |
+        # 获取所有以 build- 开头的release
+        releases=$(gh release list --repo ${{ github.repository }} --limit 100 --json tagName,isDraft --jq '.[] | select(.tagName | startswith("build-")) | .tagName')
+        
+        if [ -z "$releases" ]; then
+          echo "No build-* releases found to delete"
+          exit 0
+        fi
+        
+        echo "Found releases:"
+        echo "$releases"
+        
+        # 转换为数组
+        readarray -t release_array <<< "$releases"
+        total_releases=${#release_array[@]}
+        
+        echo "Total build-* releases: $total_releases"
+        echo "Keeping latest ${{ env.RELEASE_RETENTION_COUNT }} releases"
+        
+        # 计算需要删除的数量
+        if [ $total_releases -gt ${{ env.RELEASE_RETENTION_COUNT }} ]; then
+          releases_to_delete=$((total_releases - ${{ env.RELEASE_RETENTION_COUNT }}))
+          echo "Need to delete $releases_to_delete releases"
+          
+          # 删除旧的release（跳过最新的几个）
+          for ((i=0; i<releases_to_delete; i++)); do
+            release_tag=${release_array[i]}
+            echo "Deleting release: $release_tag"
+            gh release delete "$release_tag" --repo ${{ github.repository }} --yes || true
+          done
+        else
+          echo "No need to delete any releases (current: $total_releases, keep: ${{ env.RELEASE_RETENTION_COUNT }})"
+        fi
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  setup:
+    runs-on: ubuntu-latest
+    needs: cleanup-releases
+    outputs:
+      config_files: ${{ steps.find-configs.outputs.config_files }}
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+    
+    - name: Find config files
+      id: find-configs
+      run: |
+        # 查找所有.config文件并格式化为JSON数组
+        config_files=$(find . -name "*.config" -printf '"%f",')
+        config_files="[${config_files%,}]"
+        echo "config_files=$config_files" >> $GITHUB_OUTPUT
+        echo "Found config files: $config_files"
 
   build:
-    needs: discover-configs
+    needs: setup
     runs-on: ubuntu-latest
-    if: ${{ needs.discover-configs.outputs.matrix != '[]' }}
+    # 关键设置：允许单个任务失败而不影响整个job
+    continue-on-error: ${{ matrix.allow_failure }}
     strategy:
-      matrix: ${{ fromJson(needs.discover-configs.outputs.matrix) }}
+      matrix:
+        config_file: ${{ fromJSON(needs.setup.outputs.config_files) }}
+        # 为每个配置设置allow_failure为true，这样单个失败不会影响其他
+        allow_failure: [true]
+      # 设置最大并行数，避免资源耗尽
+      max-parallel: 4
+      # 即使某些任务失败也继续执行其他任务
       fail-fast: false
-    name: ${{ matrix.name }}
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
 
-      - name: Cache downloads
-        uses: actions/cache@v4
-        with:
-          key: dl-${{ runner.os }}-immortalwrt-master-${{ hashFiles('feeds.conf.default') }}
-          path: dl
-          restore-keys: |
-            dl-${{ runner.os }}-immortalwrt-master-
+    - name: Set up build environment
+      run: |
+        sudo bash -c 'bash <(curl -s https://build-scripts.immortalwrt.org/init_build_environment.sh)'
 
-      - name: Cache ccache
-        uses: actions/cache@v4
-        with:
-          key: ccache-${{ matrix.name }}-${{ runner.os }}-${{ hashFiles(matrix.config) }}
-          path: ~/.ccache
-          restore-keys: |
-            ccache-${{ matrix.name }}-${{ runner.os }}-
+    # 恢复缓存
+    - name: Restore ccache cache
+      uses: actions/cache@v3
+      id: restore-ccache
+      with:
+        path: ${{ env.CCACHE_DIR }}
+        key: ${{ runner.os }}-ccache-${{ github.workflow }}-${{ github.ref }}-${{ hashFiles('**/*.config', 'diy.sh') }}
+        restore-keys: |
+          ${{ runner.os }}-ccache-${{ github.workflow }}-${{ github.ref }}-
+          ${{ runner.os }}-ccache-${{ github.workflow }}-
+          ${{ runner.os }}-ccache-
 
-      - name: Prepare build environment
-        run: sudo bash -c 'bash <(curl -s https://build-scripts.immortalwrt.org/init_build_environment.sh)'
+    - name: Restore dl directory cache
+      uses: actions/cache@v3
+      id: restore-dl
+      with:
+        path: ${{ env.DL_DIR }}
+        key: ${{ runner.os }}-dl-${{ github.workflow }}-${{ github.ref }}-${{ hashFiles('**/*.config', 'diy.sh') }}
+        restore-keys: |
+          ${{ runner.os }}-dl-${{ github.workflow }}-${{ github.ref }}-
+          ${{ runner.os }}-dl-${{ github.workflow }}-
+          ${{ runner.os }}-dl-
 
-      - name: Clone ImmortalWRT
-        run: git clone -b master https://github.com/immortalwrt/immortalwrt
+    - name: Cache status
+      run: |
+        echo "CCache cache restored: ${{ steps.restore-ccache.outputs.cache-hit }}"
+        echo "DL cache restored: ${{ steps.restore-dl.outputs.cache-hit }}"
+        
+        # 如果是缓存命中，显示缓存信息
+        if [ "${{ steps.restore-ccache.outputs.cache-hit }}" = "true" ]; then
+          echo "CCache directory size: $(du -sh ${{ env.CCACHE_DIR }} 2>/dev/null || echo '0')"
+        fi
+        
+        if [ "${{ steps.restore-dl.outputs.cache-hit }}" = "true" ]; then
+          echo "DL directory size: $(du -sh ${{ env.DL_DIR }} 2>/dev/null || echo '0')"
+        fi
 
-      - name: Move downloads cache if exists
-        run: |
-          if [ -d dl ]; then
-            mv dl immortalwrt/dl
-          fi
+    - name: Clone ImmortalWrt repository
+      run: |
+        git clone https://github.com/immortalwrt/immortalwrt.git --depth=1 -b master $BUILD_DIR
 
-      - name: Update and install feeds
-        working-directory: immortalwrt
-        run: |
-          ./scripts/feeds update -a
-          ./scripts/feeds install -a
+    - name: Set up ccache and dl directories
+      run: |
+        # 创建符号链接到缓存目录
+        ln -sf ${{ env.CCACHE_DIR }} $BUILD_DIR/ccache
+        ln -sf ${{ env.DL_DIR }} $BUILD_DIR/dl
+        
+        # 确保目录存在
+        mkdir -p ${{ env.CCACHE_DIR }} ${{ env.DL_DIR }}
+        
+        # 配置ccache
+        echo "CCACHE_DIR=${{ env.CCACHE_DIR }}" >> $GITHUB_ENV
+        echo "CCACHE_MAXSIZE=5G" >> $GITHUB_ENV
+        echo "CCACHE_COMPRESS=1" >> $GITHUB_ENV
+        echo "CCACHE_COMPRESSLEVEL=6" >> $GITHUB_ENV
 
-      - name: Run diy.sh if exists
-        working-directory: immortalwrt
-        run: |
-          if [ -f ../diy.sh ]; then
-            cp ../diy.sh .
-            chmod +x diy.sh
-            ./diy.sh
-          fi
+    - name: Copy config file
+      run: |
+        cp "${{ matrix.config_file }}" $BUILD_DIR/.config
+        echo "Using config file: ${{ matrix.config_file }}"
 
-      - name: Copy config and build
-        working-directory: immortalwrt
-        env:
-          CONFIG_CCACHE: y
-        run: |
-          cp ../${{ matrix.config }} .config
-          make defconfig
-          make download -j$(nproc)
-          make -j$(nproc) V=s
+    - name: Check and copy diy.sh if exists
+      run: |
+        if [ -f diy.sh ]; then
+          cp diy.sh $BUILD_DIR/
+          chmod +x $BUILD_DIR/diy.sh
+          echo "diy.sh found and copied"
+        else
+          echo "diy.sh not found, skipping"
+        fi
 
-      - name: Move downloads back to cache
-        if: always()
-        run: |
-          if [ -d immortalwrt/dl ]; then
-            mv immortalwrt/dl .
-          fi
+    - name: Update feeds
+      run: |
+        cd $BUILD_DIR
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
 
-      - name: Compress firmware
-        working-directory: immortalwrt/bin/targets
-        if: success()
-        run: |
-          for file in $(find . -type f -name '*.bin' -o -name '*.img' -o -name '*.gz'); do
-            zip -r "${file}.zip" "$file"
-          done
+    - name: Run diy.sh if exists
+      run: |
+        cd $BUILD_DIR
+        if [ -f diy.sh ]; then
+          echo "Running diy.sh..."
+          ./diy.sh
+        else
+          echo "diy.sh not found, skipping"
+        fi
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        if: success()
-        with:
-          name: firmware-${{ matrix.name }}
-          path: immortalwrt/bin/targets/**/*.zip
+    - name: Build firmware
+      run: |
+        set +e  # 允许脚本中的命令失败而不退出
+        
+        cd $BUILD_DIR
+        
+        # 从文件名解析AAA和BBB
+        CONFIG_FILE="${{ matrix.config_file }}"
+        FILENAME=$(echo "$CONFIG_FILE" | sed 's/\.config$//')
+        
+        IFS=';' read -ra PARTS <<< "$FILENAME"
+        AAA=${PARTS[0]}
+        BBB=${PARTS[1]}
+        
+        echo "Building for: AAA=$AAA, BBB=$BBB"
+        
+        # 启用ccache
+        export CCACHE_DIR=${{ env.CCACHE_DIR }}
+        export CCACHE_MAXSIZE=5G
+        export CCACHE_COMPRESS=1
+        export CCACHE_COMPRESSLEVEL=6
+        
+        # 生成defconfig，过滤常见的无害警告
+        make defconfig 2>&1 | grep -E -v \
+          -e "WARNING:.*does not exist" \
+          -e "WARNING:.*missing dependencies" \
+          -e "WARNING:.*depends on" || true
+        
+        # 检查defconfig是否成功
+        if [ ! -f .config ]; then
+          echo "Error: .config file was not created!"
+          exit 1
+        fi
+        
+        echo "Defconfig completed successfully"
+        
+        # 开始编译 - 使用ccache
+        echo "Starting compilation with ccache and $(($(nproc) + 1)) threads..."
+        
+        # 尝试编译，但即使失败也继续执行后续步骤
+        make -j$(($(nproc) + 1)) CCACHE=1 2>&1 | tee compile.log
+        COMPILE_STATUS=${PIPESTATUS[0]}
+        
+        if [ $COMPILE_STATUS -ne 0 ]; then
+          echo "Multi-thread compilation failed, retrying with single thread..."
+          make -j1 V=s CCACHE=1 2>&1 | tee compile-single.log
+          COMPILE_STATUS=${PIPESTATUS[0]}
+        fi
+        
+        if [ $COMPILE_STATUS -eq 0 ]; then
+          echo "Compilation successful"
+          # 创建输出目录
+          mkdir -p ../firmware-output/${AAA}
+          
+          # 复制编译好的固件
+          find bin/targets/ -name "*.bin" -exec cp {} ../firmware-output/${AAA}/ \; 2>/dev/null || true
+          find bin/targets/ -name "*.gz" -exec cp {} ../firmware-output/${AAA}/ \; 2>/dev/null || true
+          find bin/targets/ -name "*.img" -exec cp {} ../firmware-output/${AAA}/ \; 2>/dev/null || true
+          find bin/targets/ -name "*.trx" -exec cp {} ../firmware-output/${AAA}/ \; 2>/dev/null || true
+          find bin/targets/ -name "*.elf" -exec cp {} ../firmware-output/${AAA}/ \; 2>/dev/null || true
+          find bin/targets/ -name "sha256sums" -exec cp {} ../firmware-output/${AAA}/ \; 2>/dev/null || true
+          
+          echo "Firmware files copied successfully to firmware-output/${AAA}"
+          ls -la ../firmware-output/${AAA}/
+        else
+          echo "Compilation failed for config: ${{ matrix.config_file }}"
+          # 这里不退出，让其他配置继续编译
+        fi
+
+    # 保存缓存
+    - name: Save ccache cache
+      uses: actions/cache@v3
+      with:
+        path: ${{ env.CCACHE_DIR }}
+        key: ${{ runner.os }}-ccache-${{ github.workflow }}-${{ github.ref }}-${{ hashFiles('**/*.config', 'diy.sh') }}
+
+    - name: Save dl directory cache
+      uses: actions/cache@v3
+      with:
+        path: ${{ env.DL_DIR }}
+        key: ${{ runner.os }}-dl-${{ github.workflow }}-${{ github.ref }}-${{ hashFiles('**/*.config', 'diy.sh') }}
+
+    - name: Create package if compilation succeeded
+      if: always()  # 无论编译是否成功都执行
+      id: package-info
+      run: |
+        # 直接从矩阵变量生成包名
+        PACKAGE_NAME=$(echo "${{ matrix.config_file }}" | sed 's/\.config$//' | sed 's/;/-/g')-firmware.zip
+        echo "package_name=${PACKAGE_NAME}" >> $GITHUB_OUTPUT
+        echo "Package name: ${PACKAGE_NAME}"
+        
+        # 从文件名解析AAA
+        FILENAME=$(echo "${{ matrix.config_file }}" | sed 's/\.config$//')
+        AAA=$(echo "$FILENAME" | cut -d';' -f1)
+        echo "aaa=${AAA}" >> $GITHUB_OUTPUT
+        
+        # 检查是否有编译输出的文件
+        if [ -d "firmware-output/${AAA}" ] && [ -n "$(ls -A firmware-output/${AAA} 2>/dev/null)" ]; then
+          echo "Creating package: ${PACKAGE_NAME}"
+          cd firmware-output/${AAA}
+          zip -r "../../${PACKAGE_NAME}" .
+          cd ../..
+          echo "Package created successfully"
+          echo "package_exists=true" >> $GITHUB_OUTPUT
+        else
+          echo "No firmware files found, creating failure marker"
+          touch "${PACKAGE_NAME}.failed"
+          echo "package_exists=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Upload successful firmware package
+      if: steps.package-info.outputs.package_exists == 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.config_file }}-success
+        path: ${{ steps.package-info.outputs.package_name }}
+        if-no-files-found: error
+
+    - name: Upload failure marker
+      if: steps.package-info.outputs.package_exists == 'false'
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.config_file }}-failed
+        path: ${{ steps.package-info.outputs.package_name }}.failed
+        if-no-files-found: ignore
 
   release:
     needs: build
     runs-on: ubuntu-latest
+    # 即使build job中有失败的任务也继续执行
     if: always()
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+    - name: Get current date
+      id: date
+      run: echo "date=$(date +'%Y-%m-%d %H:%M:%S')" >> $GITHUB_OUTPUT
 
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: ./artifacts
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: all-artifacts
 
-      - name: Create release
-        run: |
-          TAG_NAME="build-$(date +%Y%m%d-%H%M%S)"
-          gh release create "$TAG_NAME" --title "$TAG_NAME" --notes "Automated build"
+    - name: Process successful builds
+      run: |
+        mkdir -p release-firmware
+        
+        # 查找所有成功的固件包
+        find all-artifacts -name "*.zip" -exec cp {} release-firmware/ \; 2>/dev/null || true
+        
+        echo "Files in release-firmware:"
+        ls -la release-firmware/ || echo "No files in release-firmware"
+        
+        # 统计成功和失败的数量
+        SUCCESS_COUNT=$(find all-artifacts -name "*.zip" | wc -l || echo 0)
+        FAILED_COUNT=$(find all-artifacts -name "*.failed" | wc -l || echo 0)
+        
+        echo "SUCCESS_COUNT=$SUCCESS_COUNT" >> $GITHUB_ENV
+        echo "FAILED_COUNT=$FAILED_COUNT" >> $GITHUB_ENV
 
-          for zip in $(find ./artifacts -type f -name '*.zip'); do
-            gh release upload "$TAG_NAME" "$zip"
-          done
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    - name: Create summary of build results
+      id: create-summary
+      run: |
+        # 创建构建结果摘要
+        SUMMARY_FILE="build-summary.md"
+        echo "# 🛠️ ImmortalWrt Build Results" > $SUMMARY_FILE
+        echo "" >> $SUMMARY_FILE
+        echo "**Build Date:** ${{ steps.date.outputs.date }}" >> $SUMMARY_FILE
+        echo "**Commit:** [${{ github.sha }}](https://github.com/${{ github.repository }}/commit/${{ github.sha }})" >> $SUMMARY_FILE
+        echo "**Workflow:** [${{ github.workflow }} #${{ github.run_number }}](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> $SUMMARY_FILE
+        echo "" >> $SUMMARY_FILE
+        
+        # 显示缓存状态
+        echo "**Cache Status:** ✅ Enabled (ccache + dl directory)" >> $SUMMARY_FILE
+        echo "" >> $SUMMARY_FILE
+        
+        echo "## ✅ Successful Builds (${{ env.SUCCESS_COUNT }})" >> $SUMMARY_FILE
+        
+        # 查找成功的构建
+        find all-artifacts -name "*.zip" | while read file; do
+          filename=$(basename "$file")
+          config_name=$(echo "$filename" | sed 's/-firmware\.zip$//')
+          echo "- 🟢 $config_name" >> $SUMMARY_FILE
+        done
+        
+        if [ ${{ env.SUCCESS_COUNT }} -eq 0 ]; then
+          echo "- No successful builds" >> $SUMMARY_FILE
+        fi
+        
+        echo "" >> $SUMMARY_FILE
+        echo "## ❌ Failed Builds (${{ env.FAILED_COUNT }})" >> $SUMMARY_FILE
+        
+        # 查找失败的构建
+        find all-artifacts -name "*.failed" | while read file; do
+          filename=$(basename "$file")
+          config_name=$(echo "$filename" | sed 's/\.failed$//')
+          echo "- 🔴 $config_name" >> $SUMMARY_FILE
+        done
+        
+        if [ ${{ env.FAILED_COUNT }} -eq 0 ]; then
+          echo "- No failed builds" >> $SUMMARY_FILE
+        fi
+        
+        # 将摘要内容设置为输出
+        SUMMARY_CONTENT=$(cat $SUMMARY_FILE)
+        echo "summary_content<<EOF" >> $GITHUB_OUTPUT
+        echo "$SUMMARY_CONTENT" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
 
-      - name: Delete old releases
-        run: |
-          releases=$(gh release list --limit 100 | sort -k3r | tail -n +6 | awk '{print $1}')
-          for rel in $releases; do
-            gh release delete "$rel" --yes
-          done
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    - name: Check if any firmware files exist
+      id: check-files
+      run: |
+        if [ -n "$(find release-firmware -name '*.zip' -type f 2>/dev/null)" ]; then
+          echo "files_exist=true" >> $GITHUB_OUTPUT
+          echo "Found firmware files:"
+          find release-firmware -name '*.zip' -type f
+        else
+          echo "files_exist=false" >> $GITHUB_OUTPUT
+          echo "No firmware files found for release"
+        fi
+
+    - name: Create release with successful firmware
+      if: steps.check-files.outputs.files_exist == 'true'
+      uses: softprops/action-gh-release@v1
+      with:
+        files: release-firmware/*.zip
+        tag_name: build-${{ github.run_id }}
+        name: "ImmortalWrt Build - ${{ steps.date.outputs.date }}"
+        body: |
+          ${{ steps.create-summary.outputs.summary_content }}
+          
+          ## 📦 Download
+          Download the firmware package for your device from the assets below.
+          
+          ## ℹ️ Note
+          - Only successful builds are included in this release.
+          - Built from [ImmortalWrt](https://github.com/immortalwrt/immortalwrt) master branch.
+          - Automatically built every 2 days.
+          - Using ccache for faster compilation.
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Create dummy release if no firmware files
+      if: steps.check-files.outputs.files_exist == 'false'
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: build-${{ github.run_id }}
+        name: "ImmortalWrt Build - ${{ steps.date.outputs.date }} (No successful builds)"
+        body: |
+          ${{ steps.create-summary.outputs.summary_content }}
+          
+          ## ❗ No Successful Builds
+          No firmware files were successfully built in this run. Check the build logs for details.
+          
+          ## ℹ️ Information
+          - Built from [ImmortalWrt](https://github.com/immortalwrt/immortalwrt) master branch.
+          - Automatically built every 2 days.
+          - Using ccache for faster compilation.
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Upload build summary as artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-summary
+        path: build-summary.md
