@@ -174,9 +174,16 @@ jobs:
 
     - name: Copy config file
       run: |
+        ls -l
+        pwd
         cp "${{ matrix.config_file }}" $BUILD_DIR/.config
         echo "Using config file: ${{ matrix.config_file }}"
         ls -l $BUILD_DIR
+        if [ -f $BUILD_DIR/.config ]; then
+          echo ".config配置文件已拷贝"
+        else
+          echo ".config文件未发现"
+        fi
 
     - name: Check and copy diy.sh if exists
       run: |
