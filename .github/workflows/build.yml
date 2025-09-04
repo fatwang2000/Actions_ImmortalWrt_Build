@@ -115,62 +115,12 @@ jobs:
     - name: Set up build environment
       run: |
         sudo bash -c 'bash <(curl -s https://build-scripts.immortalwrt.org/init_build_environment.sh)'
+        sudo apt install lm-sensors
 
-    # 恢复缓存
-    - name: Restore ccache cache
-      uses: actions/cache@v3
-      id: restore-ccache
-      with:
-        path: ${{ env.CCACHE_DIR }}
-        key: ${{ runner.os }}-ccache-${{ github.workflow }}-${{ github.ref }}-${{ hashFiles('**/*.config', 'diy.sh') }}
-        restore-keys: |
-          ${{ runner.os }}-ccache-${{ github.workflow }}-${{ github.ref }}-
-          ${{ runner.os }}-ccache-${{ github.workflow }}-
-          ${{ runner.os }}-ccache-
-
-    - name: Restore dl directory cache
-      uses: actions/cache@v3
-      id: restore-dl
-      with:
-        path: ${{ env.DL_DIR }}
-        key: ${{ runner.os }}-dl-${{ github.workflow }}-${{ github.ref }}-${{ hashFiles('**/*.config', 'diy.sh') }}
-        restore-keys: |
-          ${{ runner.os }}-dl-${{ github.workflow }}-${{ github.ref }}-
-          ${{ runner.os }}-dl-${{ github.workflow }}-
-          ${{ runner.os }}-dl-
-
-    - name: Cache status
-      run: |
-        echo "CCache cache restored: ${{ steps.restore-ccache.outputs.cache-hit }}"
-        echo "DL cache restored: ${{ steps.restore-dl.outputs.cache-hit }}"
-        
-        # 如果是缓存命中，显示缓存信息
-        if [ "${{ steps.restore-ccache.outputs.cache-hit }}" = "true" ]; then
-          echo "CCache directory size: $(du -sh ${{ env.CCACHE_DIR }} 2>/dev/null || echo '0')"
-        fi
-        
-        if [ "${{ steps.restore-dl.outputs.cache-hit }}" = "true" ]; then
-          echo "DL directory size: $(du -sh ${{ env.DL_DIR }} 2>/dev/null || echo '0')"
-        fi
-
+   
     - name: Clone ImmortalWrt repository
       run: |
         git clone https://github.com/immortalwrt/immortalwrt.git --depth=1 -b openwrt-24.10 $BUILD_DIR
-
-    - name: Set up ccache and dl directories
-      run: |
-        # 创建符号链接到缓存目录
-        ln -sf ${{ env.CCACHE_DIR }} $BUILD_DIR/ccache
-        ln -sf ${{ env.DL_DIR }} $BUILD_DIR/dl
-        
-        # 确保目录存在
-        mkdir -p ${{ env.CCACHE_DIR }} ${{ env.DL_DIR }}
-        
-        # 配置ccache
-        echo "CCACHE_DIR=${{ env.CCACHE_DIR }}" >> $GITHUB_ENV
-        echo "CCACHE_MAXSIZE=5G" >> $GITHUB_ENV
-        echo "CCACHE_COMPRESS=1" >> $GITHUB_ENV
-        echo "CCACHE_COMPRESSLEVEL=6" >> $GITHUB_ENV
 
     - name: Copy config file
       run: |
@@ -225,7 +175,7 @@ jobs:
         AAA=${PARTS[0]}
         BBB=${PARTS[1]}
         
-        echo "Building for: AAA=$AAA, BBB=$BBB"
+        echo "Building for: Owner=$AAA, Type=$BBB"
         
         # 启用ccache
         export CCACHE_DIR=${{ env.CCACHE_DIR }}
